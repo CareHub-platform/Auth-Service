@@ -353,3 +353,464 @@ EMAIL_FROM=no-reply@yourapp.com
    - Implement health check endpoints
 
 Would you like me to elaborate on any specific part of this architecture or provide more detailed code examples for any component?
+---------------------------------------------------------
+
+# Role-Based Authentication System with OAuth and Local Login
+
+I'll expand the authentication system to include role-based access control (RBAC) while maintaining both local (email/password) and OAuth login options.
+
+## Updated Database Schema (PostgreSQL)
+
+```sql
+-- Roles table
+CREATE TABLE roles (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(50) UNIQUE NOT NULL,
+    description TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Insert default roles
+INSERT INTO roles (name, description) VALUES 
+('patient', 'Regular patient user'),
+('doctor', 'Medical doctor'),
+('lab_analyst', 'Laboratory analysis professional'),
+('radiologist', 'Radiology center professional'),
+('pharmacist', 'Medications company representative'),
+('admin', 'System administrator');
+
+-- Add role_id to users table
+ALTER TABLE users ADD COLUMN role_id INTEGER REFERENCES roles(id) DEFAULT 1;
+
+-- User permissions table (if you need granular permissions)
+CREATE TABLE permissions (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) UNIQUE NOT NULL,
+    description TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Role-Permission mapping
+CREATE TABLE role_permissions (
+    role_id INTEGER REFERENCES roles(id) ON DELETE CASCADE,
+    permission_id INTEGER REFERENCES permissions(id) ON DELETE CASCADE,
+    PRIMARY KEY (role_id, permission_id)
+);
+```
+
+## Updated User Model (models/user.model.js)
+
+```javascript
+const { DataTypes } = require('sequelize');
+const bcrypt = require('bcrypt');
+
+module.exports = (sequelize) => {
+  const User = sequelize.define('User', {
+    email: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      unique: true,
+      validate: {
+        isEmail: true
+      }
+    },
+    password_hash: {
+      type: DataTypes.STRING
+    },
+    first_name: {
+      type: DataTypes.STRING,
+      allowNull: false
+    },
+    last_name: {
+      type: DataTypes.STRING,
+      allowNull: false
+    },
+    is_verified: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false
+    },
+    is_active: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: true
+    },
+    role_id: {
+      type: DataTypes.INTEGER,
+      defaultValue: 1, // Default to patient role
+      references: {
+        model: 'roles',
+        key: 'id'
+      }
+    }
+  }, {
+    hooks: {
+      beforeCreate: async (user) => {
+        if (user.password_hash) {
+          const salt = await bcrypt.genSalt(10);
+          user.password_hash = await bcrypt.hash(user.password_hash, salt);
+        }
+      }
+    }
+  });
+
+  User.associate = (models) => {
+    User.belongsTo(models.Role, { foreignKey: 'role_id' });
+    User.hasMany(models.UserOAuthAccount, { foreignKey: 'user_id' });
+  };
+
+  User.prototype.verifyPassword = async function(password) {
+    return await bcrypt.compare(password, this.password_hash);
+  };
+
+  return User;
+};
+```
+
+## Registration Flow with Role Selection
+
+### Backend Controller (controllers/auth.controller.js)
+
+```javascript
+const { User, Role } = require('../models');
+const { generateJWT } = require('../utils/jwt');
+const { sendVerificationEmail } = require('../utils/email');
+
+exports.register = async (req, res) => {
+  try {
+    const { email, password, first_name, last_name, role } = req.body;
+
+    // Validate role exists
+    const roleRecord = await Role.findOne({ where: { name: role } });
+    if (!roleRecord) {
+      return res.status(400).json({ error: 'Invalid role specified' });
+    }
+
+    // Check if user already exists
+    const existingUser = await User.findOne({ where: { email } });
+    if (existingUser) {
+      return res.status(400).json({ error: 'Email already in use' });
+    }
+
+    // Create new user
+    const user = await User.create({
+      email,
+      password_hash: password, // Will be hashed by model hook
+      first_name,
+      last_name,
+      role_id: roleRecord.id
+    });
+
+    // Generate verification token and send email
+    const verificationToken = generateVerificationToken(user.id);
+    await sendVerificationEmail(user.email, verificationToken);
+
+    // Respond without sensitive data
+    const userData = user.get({ plain: true });
+    delete userData.password_hash;
+
+    res.status(201).json({
+      message: 'Registration successful. Please check your email for verification.',
+      user: userData
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+```
+
+## Frontend Registration Form (Next.js)
+
+```jsx
+import { useState } from 'react';
+import { useRouter } from 'next/router';
+
+export default function RegisterPage() {
+  const [formData, setFormData] = useState({
+    email: '',
+    password: '',
+    firstName: '',
+    lastName: '',
+    role: 'patient'
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const router = useRouter();
+
+  const handleChange = (e) => {
+    setFormData({
+      ...formData,
+      [e.target.name]: e.target.value
+    });
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+
+    try {
+      const response = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          email: formData.email,
+          password: formData.password,
+          first_name: formData.firstName,
+          last_name: formData.lastName,
+          role: formData.role
+        })
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Registration failed');
+      }
+
+      // Redirect to verification page
+      router.push('/verify-email?email=' + encodeURIComponent(formData.email));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="register-container">
+      <h1>Create Account</h1>
+      {error && <div className="error-message">{error}</div>}
+      
+      <form onSubmit={handleSubmit}>
+        <div className="form-group">
+          <label>Email</label>
+          <input
+            type="email"
+            name="email"
+            value={formData.email}
+            onChange={handleChange}
+            required
+          />
+        </div>
+        
+        <div className="form-group">
+          <label>Password</label>
+          <input
+            type="password"
+            name="password"
+            value={formData.password}
+            onChange={handleChange}
+            required
+            minLength="8"
+          />
+        </div>
+        
+        <div className="form-group">
+          <label>First Name</label>
+          <input
+            type="text"
+            name="firstName"
+            value={formData.firstName}
+            onChange={handleChange}
+            required
+          />
+        </div>
+        
+        <div className="form-group">
+          <label>Last Name</label>
+          <input
+            type="text"
+            name="lastName"
+            value={formData.lastName}
+            onChange={handleChange}
+            required
+          />
+        </div>
+        
+        <div className="form-group">
+          <label>I am a</label>
+          <select
+            name="role"
+            value={formData.role}
+            onChange={handleChange}
+            required
+          >
+            <option value="patient">Patient</option>
+            <option value="doctor">Doctor</option>
+            <option value="lab_analyst">Laboratory Analyst</option>
+            <option value="radiologist">Radiology Specialist</option>
+            <option value="pharmacist">Pharmacist</option>
+          </select>
+        </div>
+        
+        <button type="submit" disabled={loading}>
+          {loading ? 'Creating account...' : 'Create Account'}
+        </button>
+      </form>
+      
+      <div className="oauth-options">
+        <p>Or sign up with:</p>
+        <button onClick={() => signIn('google')}>Google</button>
+        <button onClick={() => signIn('github')}>GitHub</button>
+      </div>
+      
+      <p className="login-link">
+        Already have an account? <a href="/login">Log in</a>
+      </p>
+    </div>
+  );
+}
+```
+
+## Role-Based Middleware (middlewares/role.middleware.js)
+
+```javascript
+const { Role } = require('../models');
+
+exports.requireRole = (roleNames) => {
+  return async (req, res, next) => {
+    try {
+      // Get user from request (attached by auth middleware)
+      const user = req.user;
+      if (!user) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      // Get user's role
+      const role = await Role.findByPk(user.role_id);
+      if (!role) {
+        return res.status(403).json({ error: 'Forbidden - Invalid role' });
+      }
+
+      // Check if user has required role
+      if (Array.isArray(roleNames)) {
+        if (!roleNames.includes(role.name)) {
+          return res.status(403).json({ error: 'Forbidden - Insufficient permissions' });
+        }
+      } else if (role.name !== roleNames) {
+        return res.status(403).json({ error: 'Forbidden - Insufficient permissions' });
+      }
+
+      // Attach role to request for downstream use
+      req.role = role.name;
+      next();
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  };
+};
+```
+
+## Using the Role Middleware in Routes
+
+```javascript
+const express = require('express');
+const router = express.Router();
+const authController = require('../controllers/auth.controller');
+const { authenticate } = require('../middlewares/auth.middleware');
+const { requireRole } = require('../middlewares/role.middleware');
+
+// Public routes
+router.post('/register', authController.register);
+router.post('/login', authController.login);
+
+// Patient-only route example
+router.get(
+  '/patient/dashboard',
+  authenticate,
+  requireRole('patient'),
+  authController.patientDashboard
+);
+
+// Doctor-only route example
+router.get(
+  '/doctor/dashboard',
+  authenticate,
+  requireRole('doctor'),
+  authController.doctorDashboard
+);
+
+// Admin-only route example
+router.get(
+  '/admin/users',
+  authenticate,
+  requireRole('admin'),
+  authController.listUsers
+);
+
+module.exports = router;
+```
+
+## OAuth Role Handling
+
+When implementing OAuth, you'll need to determine the user's role. You can:
+
+1. Ask for role during first-time OAuth login
+2. Use email domain to infer role (e.g., @hospital.com → doctor)
+3. Default to patient role and allow role upgrade later
+
+Here's how to modify the OAuth callback handler:
+
+```javascript
+exports.oauthCallback = async (req, res) => {
+  try {
+    const { provider, code } = req.body;
+    
+    // Handle OAuth flow (get user info from provider)
+    const oauthUser = await oauthService.handleOAuthFlow(provider, code);
+    
+    // Check if user exists
+    let user = await User.findOne({
+      where: { email: oauthUser.email },
+      include: [Role]
+    });
+
+    // If new user, create with default patient role
+    if (!user) {
+      const patientRole = await Role.findOne({ where: { name: 'patient' } });
+      user = await User.create({
+        email: oauthUser.email,
+        first_name: oauthUser.given_name || oauthUser.name.split(' ')[0],
+        last_name: oauthUser.family_name || oauthUser.name.split(' ')[1] || '',
+        is_verified: true, // OAuth emails are typically verified
+        role_id: patientRole.id
+      });
+    }
+
+    // Generate tokens
+    const tokens = await generateJWT(user);
+
+    res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        first_name: user.first_name,
+        last_name: user.last_name,
+        role: user.Role.name
+      },
+      ...tokens
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+```
+
+## Additional Considerations
+
+1. **Role-Specific Registration Fields**:
+   - Doctors might need license numbers
+   - Pharmacists might need company information
+   - Consider separate registration flows or additional profile steps
+
+2. **Role Change Requests**:
+   - Implement admin approval for role upgrades
+   - Add verification for professional roles (doctor, pharmacist, etc.)
+
+3. **Profile Completion**:
+   - Require additional information after registration based on role
+   - Different dashboard views for each role
+
+Would you like me to elaborate on any specific aspect, such as the role change approval process, professional verification, or the different dashboard implementations for each role?
